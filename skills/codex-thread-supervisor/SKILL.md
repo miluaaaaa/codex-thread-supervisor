@@ -36,3 +36,5 @@ This explicit mode replaces fixed cadence/legacy 3x backoff; `tune --mode base`
 restores the original base and fixed setting. Include the documented `gpu` object
 in progress reports, or call `observe --metrics-file` at task events. Never invent
 GPU targets, verified counts, capacity or ETAs. No Slurm poller is installed.
+
+无固定卡数目标时，GPU 统计的 `target_gpus` 显式填 `null`；不得为满足字段校验创造卡数上限。按已核验执行卡与预检待跑 lane 统计当前任务需求。

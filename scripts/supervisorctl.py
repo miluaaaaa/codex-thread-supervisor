@@ -1054,6 +1054,7 @@ def observe_task(thread_id: str, metrics) -> dict[str, Any]:
         raise RuntimeError("observe requires an active adaptive supervisor")
     previous = int(state["interval_seconds"])
     observe_gpu(state, metrics)
+    state.pop("gpu_metrics_error", None)
     apply_optimizer(state)
     if int(state["interval_seconds"]) != previous:
         refresh_timer_interval(thread_id, int(state["interval_seconds"]))

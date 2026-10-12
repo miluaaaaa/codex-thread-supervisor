@@ -49,3 +49,17 @@ class OptimizerTests(unittest.TestCase):
         observe(s,dict(m2,observed_at=2000),2000)
         self.assertEqual(s['gpu_task_stats']['unknown_seconds'],880)
         with self.assertRaises(ValueError):observe(s,m,2000)
+
+    def test_unbounded_target_tracks_runnable_demand_without_inventing_cap(self):
+        m=self.metrics();m.update(target_gpus=None,verified_gpus=11,ready_lanes=25,capacity='unavailable')
+        s={};observe(s,m,1000)
+        self.assertIsNone(s['gpu_metrics']['target_gpus'])
+        self.assertEqual(choose_interval(s,1000)[0],180)
+        m=dict(m,observed_at=1060,capacity='available');observe(s,m,1060)
+        self.assertEqual(choose_interval(s,1060)[0],60)
+        self.assertEqual(s['gpu_task_stats']['shortfall_gpu_seconds'],25*60)
+        self.assertEqual(s['gpu_task_stats']['target_gpu_seconds'],36*60)
+        m=dict(m,observed_at=1120,ready_lanes=0);observe(s,m,1120)
+        self.assertEqual(choose_interval(s,1120)[0],300)
+        m.pop('target_gpus')
+        with self.assertRaises(ValueError):validate_metrics(m,1120)
