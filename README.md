@@ -114,3 +114,45 @@ python3 -m compileall -q scripts tests
 ```
 
 Tests cover controller state transitions, nonce confirmation, busy-turn gates, PID/pane identity, fault retirement, five-cycle notification admission, durable outbox retries, and a real isolated tmux transport smoke test using `cat`. The smoke test does not run a model or submit a turn to your live conversations. Private production deployment is not a substitute for verifying this extracted backend against your installed Codex transcript format.
+
+## Adaptive GPU task supervision
+
+```sh
+codex-supervisor tune --thread UUID --mode adaptive
+codex-supervisor observe --thread UUID --metrics-file task-gpu.json
+codex-supervisor tune --thread UUID --mode base
+```
+
+Only existing active supervisors can be tuned; the original frontend, instance,
+nonce and busy-turn guards remain intact. Adaptive mode explicitly overrides a
+fixed interval and legacy 3x capacity backoff, without creating a new conversation.
+Ordinary timers still accept 5 minutes–7 days. Adaptive timers choose 60–900 seconds:
+ready work below its GPU target gets 60s, confirmed capacity shortage gets 180s,
+and stable work uses `2 * 0.05 * job_runtime_seconds`, bounded by the next
+completion horizon / 4. These are polling-delay heuristics, not a guarantee of
+5% idle time or maximum hardware utilization. Active turns are never interrupted.
+
+Task owners append a `gpu` object to their normal progress JSON or send it through
+`observe` immediately after a dispatch/completion/failure event:
+
+```json
+{"observed_at": 0, "target_gpus": 8, "verified_gpus": 6, "ready_lanes": 2,
+ "capacity": "available", "evidence": "path to model PID/memory/compute evidence",
+ "job_runtime_seconds": 180, "next_completion_seconds": 60}
+```
+
+Replace `observed_at` with the current Unix timestamp and all counts with actual
+owner observations. Reports older than 600 seconds, future timestamps, unordered
+observations and nonfinite values are rejected. The evidence reference is owner
+input; this module cannot independently prove execution and never authorizes a
+GPU launch or result acceptance. Duplicate observations do not inflate counters.
+Per-task `gpu_task_stats` integrates reported target/verified/shortfall GPU seconds
+only between samples at most 600 seconds apart; longer gaps are unknown time.
+These sampled counts are not continuous SM utilization or benchmark throughput.
+
+A completion adapter must actively call `observe`; the module does not subscribe
+to Slurm or install an HPC poller. Dispatchers should refill compatible, validated
+work on job completion immediately, without waiting for a Codex supervision turn.
+A shorter chat timer cannot repair missing runnable work, invalid adapters, model
+CPU/I/O bottlenecks or a failed frontend. The public tmux backend and private TLS
+backend remain separate; adding this feature does not migrate private sessions.

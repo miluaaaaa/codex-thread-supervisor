@@ -27,3 +27,12 @@ After two identical non-capacity fault reports, diagnose or repair and verify on
 When the task is verified complete, stop the supervisor before replying with `TLS_SUPERVISION_COMPLETE`. A completion integration should call `codex-supervisor activity --event completed --turn-id TURN --thread UUID` after the reply; this preserves the final notification after an explicit stop. Without a completion integration, active supervisors collect replies on their next timer tick.
 
 Notifications are durable outbox records: every five distinct completed supervision turns, plus a final report. Chat delivery needs a separate transport adapter. Do not fabricate a successful Feishu/webhook delivery from an outbox file.
+
+For an explicit request to optimize GPU supervision, enable `tune --mode adaptive`
+only on the requested existing supervisor(s). The automatic range is 60–900
+seconds; ready work with a target shortfall uses 60 seconds, confirmed capacity
+shortage 180 seconds. Stable work uses observed runtime and remaining duration.
+This explicit mode replaces fixed cadence/legacy 3x backoff; `tune --mode base`
+restores the original base and fixed setting. Include the documented `gpu` object
+in progress reports, or call `observe --metrics-file` at task events. Never invent
+GPU targets, verified counts, capacity or ETAs. No Slurm poller is installed.

@@ -20,6 +20,12 @@ from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Callable
 
+# Completion hooks load this controller by file, outside the scripts directory.
+SCRIPTS_ROOT = str(Path(__file__).resolve().parent)
+if SCRIPTS_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPTS_ROOT)
+from gpu_optimizer import observe as observe_gpu, apply_optimizer, prompt_direction
+
 
 from notifications import queue_report
 
@@ -325,7 +331,7 @@ def marker_for_nonce(snapshot: dict[str, Any], nonce: str) -> tuple[str, str]:
     return turn_id, marker
 
 
-def progress_report(final: str) -> dict[str, str] | None:
+def progress_report(final: str) -> dict[str, Any] | None:
     for line in final.splitlines():
         if not line.startswith(STATE_PREFIX):
             continue
@@ -339,7 +345,10 @@ def progress_report(final: str) -> dict[str, str] | None:
             return None
         if report["status"] == "fault" and not report["fault"].strip():
             return None
-        return {key: report[key].strip() for key in ("status", "fault", "evidence")}
+        parsed = {key: report[key].strip() for key in ("status", "fault", "evidence")}
+        if "gpu" in report:
+            parsed["gpu"] = report["gpu"]
+        return parsed
     return None
 
 
@@ -360,6 +369,14 @@ def record_progress(state: dict[str, Any], final: str) -> None:
     state["base_interval_seconds"] = base
     state["gpu_capacity_wait"] = gpu_wait
     state["interval_seconds"] = base * 3 if gpu_wait and not state.get("fixed_interval", False) else base
+    if state.get("gpu_optimizer", {}).get("enabled"):
+        if "gpu" in report:
+            try:
+                observe_gpu(state, report["gpu"])
+                state.pop("gpu_metrics_error", None)
+            except ValueError as error:
+                state["gpu_metrics_error"] = str(error)
+        apply_optimizer(state)
     stalled = (
         not gpu_wait and report["status"] == "fault"
         and report["fault"] == state.get("last_fault")
@@ -424,7 +441,10 @@ def supervision_prompt(nonce: str, task: str, now: int | None = None, *, state: 
         direction = "核查进展；遇故障须行动。"
     direction += peer_notification_direction(state, now)
     direction += agent_mail_notification_direction(state, now)
-    if state.get("fixed_interval"):
+    direction += prompt_direction(state)
+    if state.get("gpu_optimizer", {}).get("enabled"):
+        direction += "周期由任务优化器调整，不使用原三倍容量退避。"
+    elif state.get("fixed_interval"):
         direction += "用户指定固定监督周期，缺GPU时也不延长周期。"
     elif state.get("gpu_capacity_wait"):
         direction += "缺GPU时保持监督，周期为基础周期三倍；恢复后还原基础周期。"
@@ -557,7 +577,22 @@ def defer_supervision(
         return state
     migrate_activity_state(state)
     now = int(time.time()) if completed_at is None else int(completed_at)
+    previous_interval = int(state["interval_seconds"])
+    if state.get("gpu_optimizer", {}).get("enabled") and completed_turn_id:
+        transcript = transcript_for(thread_id, Path(str(state["codex_home"])))
+        if transcript is not None:
+            final = thread_snapshot(transcript)["completions"].get(completed_turn_id, "")
+            report = progress_report(final)
+            if report and "gpu" in report:
+                try:
+                    observe_gpu(state, report["gpu"], now)
+                    state.pop("gpu_metrics_error", None)
+                except ValueError as error:
+                    state["gpu_metrics_error"] = str(error)
+        apply_optimizer(state, now)
     interval_seconds = int(state["interval_seconds"])
+    if interval_seconds != previous_interval:
+        refresh_timer_interval(thread_id, interval_seconds)
     active_turn_id = str(state.get("activity_turn_id", ""))
     completes_active_turn = bool(completed_turn_id and completed_turn_id == active_turn_id)
     no_identified_active_turn = not active_turn_id and not state.get("activity_turn_active", False)
@@ -686,7 +721,7 @@ Description=Visibly supervise Codex thread {thread_id} every {interval_seconds} 
 [Timer]
 OnActiveSec={interval_seconds}s
 OnUnitActiveSec={interval_seconds}s
-AccuracySec=1min
+AccuracySec=5s
 Persistent=false
 Unit={service_name}
 
@@ -723,6 +758,7 @@ def refresh_timer_interval(thread_id: str, interval_seconds: int) -> None:
         return
     timer = path.read_text(encoding="utf-8")
     timer = re.sub(r"(?m)^(OnActiveSec|OnUnitActiveSec)=.*$", lambda m: f"{m[1]}={interval_seconds}s", timer)
+    timer = re.sub(r"(?m)^AccuracySec=.*$", "AccuracySec=5s", timer)
     atomic_text(path, timer, mode=0o644)
     run_systemctl("daemon-reload")
     run_systemctl("restart", timer_name)
@@ -822,6 +858,11 @@ def prepare_supervision(thread_id: str) -> dict[str, Any]:
         write_state(thread_id, state)
         return state
 
+    old_interval = int(state["interval_seconds"])
+    apply_optimizer(state, now)
+    if int(state["interval_seconds"]) != old_interval:
+        refresh_timer_interval(thread_id, int(state["interval_seconds"]))
+        state["next_trigger_at"] = min(int(state.get("next_trigger_at", now)), now + int(state["interval_seconds"]))
     interval_seconds = int(state["interval_seconds"])
     raw_next_trigger_at = state.get("next_trigger_at")
     if not isinstance(raw_next_trigger_at, (int, float)) or snapshot["has_unverified_completion"]:
@@ -979,6 +1020,48 @@ def collect_completed_report(thread_id: str) -> None:
             queue_report(state, nonce, str(snapshot["completions"][turn]))
 
 
+@serialized
+def tune_supervisor(thread_id: str, enabled: bool, metrics=None) -> dict[str, Any]:
+    state = load_state(thread_id)
+    if not state.get("active"):
+        raise RuntimeError("adaptive tuning requires an active supervisor")
+    if not binding_matches(state.get("frontend_binding", {}), frontend_for(thread_id)):
+        raise RuntimeError("original frontend binding is no longer valid")
+    now = int(time.time())
+    if metrics is not None:
+        observe_gpu(state, metrics, now)
+    previous_fixed = state.get("gpu_optimizer", {}).get("previous_fixed_interval", state.get("fixed_interval", False))
+    if enabled:
+        state["gpu_optimizer"] = {"enabled": True, "min_seconds": 60,
+                                  "max_seconds": 900, "idle_fraction": .05,
+                                  "previous_fixed_interval": previous_fixed}
+        state["fixed_interval"] = False
+        apply_optimizer(state, now)
+    else:
+        state["gpu_optimizer"] = {"enabled": False}
+        state["fixed_interval"] = previous_fixed
+        state["interval_seconds"] = int(state.get("base_interval_seconds", 300))
+    refresh_timer_interval(thread_id, int(state["interval_seconds"]))
+    state["next_trigger_at"] = now + int(state["interval_seconds"])
+    write_state(thread_id, state)
+    return state
+
+
+@serialized
+def observe_task(thread_id: str, metrics) -> dict[str, Any]:
+    state = load_state(thread_id)
+    if not state.get("active") or not state.get("gpu_optimizer", {}).get("enabled"):
+        raise RuntimeError("observe requires an active adaptive supervisor")
+    previous = int(state["interval_seconds"])
+    observe_gpu(state, metrics)
+    apply_optimizer(state)
+    if int(state["interval_seconds"]) != previous:
+        refresh_timer_interval(thread_id, int(state["interval_seconds"]))
+        state["next_trigger_at"] = int(time.time()) + int(state["interval_seconds"])
+    write_state(thread_id, state)
+    return state
+
+
 def public_state(state: dict[str, Any]) -> dict[str, Any]:
     result = dict(state)
     thread_id = str(result.get("thread_id", ""))
@@ -1007,6 +1090,12 @@ def main() -> int:
     activity.add_argument("--thread")
     activity.add_argument("--event", choices=("prompt", "started", "completed"), required=True)
     activity.add_argument("--turn-id", default="")
+    tune = subparsers.add_parser("tune")
+    tune.add_argument("--thread")
+    tune.add_argument("--mode", choices=("adaptive", "base"), required=True)
+    observation = subparsers.add_parser("observe")
+    observation.add_argument("--thread")
+    observation.add_argument("--metrics-file", type=Path, required=True)
     subparsers.add_parser("list")
     args = parser.parse_args()
 
@@ -1025,6 +1114,10 @@ def main() -> int:
         interval_seconds = parse_interval(args.interval)
         codex_home = args.codex_home or Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
         payload = start_supervisor(thread_id, interval_seconds, codex_home, args.task, gpu_wait=args.gpu_wait, fixed_interval=args.fixed_interval)
+    elif args.command == "tune":
+        payload = tune_supervisor(thread_id, args.mode == "adaptive")
+    elif args.command == "observe":
+        payload = observe_task(thread_id, json.loads(args.metrics_file.read_text()))
     elif args.command == "stop":
         payload = stop_supervisor(thread_id)
     elif args.command == "run":

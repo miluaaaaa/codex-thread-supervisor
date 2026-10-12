@@ -81,3 +81,29 @@ python3 -m compileall -q scripts tests
 测试包括状态机、nonce确认、故障停止、绑定检查、五轮通知、失败重试，以及使用`cat`的真实隔离tmux传输检查。不会向你的运行对话发送测试内容，不运行模型。公开版仍需在使用者安装的Codex版本上验证记录格式兼容性。
 
 详细配置和可选Zen/Agent Mail元数据接口见[英文说明](README.md)。
+
+## 按任务调整 GPU 监督周期
+
+```sh
+codex-supervisor tune --thread UUID --mode adaptive
+codex-supervisor observe --thread UUID --metrics-file task-gpu.json
+codex-supervisor tune --thread UUID --mode base
+```
+
+只调整已有、仍活动的监督器，保留原窗口绑定、实例、nonce 和运行中对话保护。自适应模式明确覆盖固定周期和旧的缺卡三倍退避，普通定时器仍接受 5 分钟至 7 天。
+
+自适应周期为 60–900 秒：有已预检任务但未达到目标卡数时 60 秒；确认无可用容量时 180 秒；稳定运行时采用任务耗时的 10%，并在预计完成前进一步缩短。这个公式把平均轮询等待控制在任务耗时的约 5%，只是启发式，不保证实际空闲比例或最高 GPU 利用率。不会打断正在运行的 Codex 回合。
+
+任务负责人在正常进度 JSON 中增加 `gpu`，或在派发、完成、失败事件后立即调用 `observe`：
+
+```json
+{"observed_at": 0, "target_gpus": 8, "verified_gpus": 6, "ready_lanes": 2,
+ "capacity": "available", "evidence": "模型 PID、显存和计算证据的引用",
+ "job_runtime_seconds": 180, "next_completion_seconds": 60}
+```
+
+将时间戳和示例数值替换为实际观测。超过 600 秒、未来时间戳、乱序记录和非有限数值会被拒绝，重复观测不增加计数。执行证据是负责人提供的引用，本模块不能独立证明模型执行，也不批准 GPU 准入或结果验收。
+
+每个任务保存 `gpu_task_stats`：根据相邻观测累计目标、已核验运行、缺口卡秒；间隔超过 600 秒计为未知时间。这些采样计数不能当作连续 SM 利用率或吞吐量。
+
+任务调度器必须主动调用事件入口，本模块不会自动订阅 Slurm。有效任务完成后应立即通过 Zen 补位，不等待下一次聊天监督。缩短监督周期无法修复没有有效待跑任务、适配失败、CPU/I/O 瓶颈或窗口掉线。公开 tmux 后端与私有 TLS 后端独立，不迁移已有对话。
