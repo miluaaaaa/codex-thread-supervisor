@@ -92,6 +92,85 @@ class SupervisorTests(unittest.TestCase):
             )
         return events
 
+    def test_adaptive_progress_changes_interval_without_legacy_triple(self):
+        state = {"base_interval_seconds": 300, "interval_seconds": 300,
+                 "gpu_optimizer": {"enabled": True}, "fixed_interval": False}
+        report = {"status": "blocked", "fault": "gpu_busy", "evidence": "checked",
+                  "gpu": {"observed_at": 1000, "target_gpus": 8, "verified_gpus": 2,
+                          "ready_lanes": 6, "capacity": "unavailable", "evidence": "PID trace"}}
+        with mock.patch('time.time', return_value=1000):
+            self.module.record_progress(state, 'TLS_SUPERVISION_STATE: ' + json.dumps(report))
+        self.assertEqual(state['interval_seconds'], 180)
+        self.assertEqual(state['gpu_task_stats']['observations'], 1)
+
+    def test_tuning_preserves_frontend_instance_and_nonce(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = self.state(root, interval_seconds=300, base_interval_seconds=300,
+                               awaiting_nonce='a'*24, fixed_interval=True)
+            with mock.patch.object(self.module, 'STATE_ROOT', root), mock.patch.object(self.module, 'frontend_for', return_value=dict(BINDING)), mock.patch.object(self.module, 'refresh_timer_interval') as refresh:
+                self.module.write_state(THREAD_ID,state)
+                result=self.module.tune_supervisor(THREAD_ID,True)
+                self.assertEqual(result['interval_seconds'],60)
+                self.assertFalse(result['fixed_interval'])
+                self.assertEqual(result['awaiting_nonce'],'a'*24)
+                self.assertEqual(result['instance_id'],'instance-test')
+                refresh.assert_called_once_with(THREAD_ID,60)
+
+    def test_completed_turn_collects_metrics_and_refreshes_timer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = {"status": "running", "fault": "", "evidence": "task trace",
+                      "gpu": {"observed_at": 1000, "target_gpus": 2,
+                              "verified_gpus": 2, "ready_lanes": 0,
+                              "evidence": "model PID trace", "job_runtime_seconds": 1800}}
+            events = [{"type": "event_msg", "payload": {"type": "task_complete",
+                       "turn_id": "owner-turn", "last_agent_message":
+                       "TLS_SUPERVISION_STATE: " + json.dumps(report)}}]
+            transcript = self.write_transcript(root, events)
+            state = self.state(root, interval_seconds=300, base_interval_seconds=300,
+                               gpu_optimizer={"enabled": True},
+                               activity_turn_active=True, activity_turn_id="owner-turn")
+            with mock.patch.object(self.module, "STATE_ROOT", root / "state"), mock.patch.object(
+                self.module, "transcript_for", return_value=transcript
+            ), mock.patch.object(self.module, "refresh_timer_interval") as refresh, mock.patch.object(
+                self.module, "run_systemctl"
+            ):
+                self.module.write_state(THREAD_ID, state)
+                result = self.module.defer_supervision(THREAD_ID, completed_at=1000,
+                                                       completed_turn_id="owner-turn")
+            self.assertEqual(result["interval_seconds"], 180)
+            self.assertEqual(result["next_trigger_at"], 1180)
+            self.assertFalse(result["activity_turn_active"])
+            self.assertEqual(result["gpu_task_stats"]["observations"], 1)
+            refresh.assert_called_once_with(THREAD_ID, 180)
+
+    def test_observation_updates_real_timer_and_disable_restores_fixed_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = self.state(root, interval_seconds=300, base_interval_seconds=300,
+                               fixed_interval=True)
+            metrics = {"observed_at": 1000, "target_gpus": 2, "verified_gpus": 0,
+                       "ready_lanes": 2, "capacity": "unavailable"}
+            with mock.patch.object(self.module, "STATE_ROOT", root / "state"), mock.patch.object(
+                self.module, "UNIT_ROOT", root / "units"
+            ), mock.patch.object(self.module, "frontend_for", return_value=dict(BINDING)), mock.patch.object(
+                self.module, "run_systemctl"
+            ), mock.patch("time.time", return_value=1000):
+                timer = root / "units" / self.module.unit_names(THREAD_ID)[1]
+                timer.parent.mkdir()
+                timer.write_text("[Timer]\nOnActiveSec=300s\nOnUnitActiveSec=300s\nAccuracySec=1min\n")
+                self.module.write_state(THREAD_ID, state)
+                self.module.tune_supervisor(THREAD_ID, True)
+                result = self.module.observe_task(THREAD_ID, metrics)
+                self.assertEqual(result["interval_seconds"], 180)
+                self.assertIn("OnActiveSec=180s", timer.read_text())
+                self.assertIn("AccuracySec=5s", timer.read_text())
+                result = self.module.tune_supervisor(THREAD_ID, False)
+                self.assertTrue(result["fixed_interval"])
+                self.assertEqual(result["interval_seconds"], 300)
+                self.assertIn("OnActiveSec=300s", timer.read_text())
+
     def test_interval_bounds(self) -> None:
         self.assertEqual(self.module.parse_interval("15min"), 900)
         self.assertEqual(self.module.parse_interval("30m"), 1800)
