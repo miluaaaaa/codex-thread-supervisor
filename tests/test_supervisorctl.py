@@ -171,6 +171,15 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual(result["interval_seconds"], 300)
                 self.assertIn("OnActiveSec=300s", timer.read_text())
 
+    def test_controller_can_be_loaded_from_external_completion_hook(self):
+        import subprocess
+        code = ("import importlib.util; "
+                "s=importlib.util.spec_from_file_location('hook_controller', " + repr(str(MODULE_PATH)) + "); "
+                "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)")
+        result = subprocess.run([sys.executable, "-I", "-c", code],
+                                cwd="/tmp", capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_interval_bounds(self) -> None:
         self.assertEqual(self.module.parse_interval("15min"), 900)
         self.assertEqual(self.module.parse_interval("30m"), 1800)

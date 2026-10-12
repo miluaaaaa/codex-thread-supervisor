@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from gpu_optimizer import observe as observe_gpu, apply_optimizer, prompt_direction
 import datetime as dt
 import fcntl
 import json
@@ -20,6 +19,12 @@ from contextlib import contextmanager
 from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Callable
+
+# Completion hooks load this controller by file, outside the scripts directory.
+SCRIPTS_ROOT = str(Path(__file__).resolve().parent)
+if SCRIPTS_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPTS_ROOT)
+from gpu_optimizer import observe as observe_gpu, apply_optimizer, prompt_direction
 
 
 from notifications import queue_report
