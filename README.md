@@ -156,3 +156,8 @@ work on job completion immediately, without waiting for a Codex supervision turn
 A shorter chat timer cannot repair missing runnable work, invalid adapters, model
 CPU/I/O bottlenecks or a failed frontend. The public tmux backend and private TLS
 backend remain separate; adding this feature does not migrate private sessions.
+
+When no fixed GPU target exists, explicitly set `target_gpus` to `null`.
+The optimizer uses verified running GPUs plus preflighted ready lanes as the
+instantaneous task demand for cadence and sampled target/shortfall counters.
+This demand is not a resource ceiling and may change with every observation.

@@ -149,7 +149,7 @@ class SupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state = self.state(root, interval_seconds=300, base_interval_seconds=300,
-                               fixed_interval=True)
+                               fixed_interval=True, gpu_metrics_error="prior invalid observation")
             metrics = {"observed_at": 1000, "target_gpus": 2, "verified_gpus": 0,
                        "ready_lanes": 2, "capacity": "unavailable"}
             with mock.patch.object(self.module, "STATE_ROOT", root / "state"), mock.patch.object(
@@ -164,6 +164,7 @@ class SupervisorTests(unittest.TestCase):
                 self.module.tune_supervisor(THREAD_ID, True)
                 result = self.module.observe_task(THREAD_ID, metrics)
                 self.assertEqual(result["interval_seconds"], 180)
+                self.assertNotIn("gpu_metrics_error", result)
                 self.assertIn("OnActiveSec=180s", timer.read_text())
                 self.assertIn("AccuracySec=5s", timer.read_text())
                 result = self.module.tune_supervisor(THREAD_ID, False)

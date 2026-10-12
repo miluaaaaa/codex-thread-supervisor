@@ -10,10 +10,13 @@ def validate_metrics(value, now=None):
     result = {}
     for key in ('observed_at', 'target_gpus', 'verified_gpus', 'ready_lanes'):
         n = value.get(key)
+        if key == 'target_gpus' and key in value and n is None:
+            result[key] = None  # No fixed cap: retain instantaneous runnable demand.
+            continue
         if type(n) is not int or n < 0 or (key != 'observed_at' and n > 4096):
             raise ValueError('invalid gpu metric: ' + key)
         result[key] = n
-    if result['target_gpus'] < 1 or not 0 <= now - result['observed_at'] <= 600:
+    if (result['target_gpus'] is not None and result['target_gpus'] < 1) or not 0 <= now - result['observed_at'] <= 600:
         raise ValueError('invalid target or stale/future GPU observation')
     capacity = value.get('capacity', 'unknown')
     if capacity not in ('available', 'unavailable', 'unknown'):
@@ -32,6 +35,11 @@ def validate_metrics(value, now=None):
     return result
 
 
+def task_demand(metrics):
+    target = metrics['target_gpus']
+    return metrics['verified_gpus'] + metrics['ready_lanes'] if target is None else target
+
+
 def observe(state, metrics, now=None):
     metrics = validate_metrics(metrics, now)
     previous = state.get('gpu_metrics')
@@ -45,7 +53,7 @@ def observe(state, metrics, now=None):
     if previous:
         elapsed = metrics['observed_at'] - previous['observed_at']
         if elapsed <= 600:
-            target = previous['target_gpus']
+            target = task_demand(previous)
             running = min(target, previous['verified_gpus'])
             stats['observed_seconds'] += elapsed
             stats['target_gpu_seconds'] += elapsed * target
@@ -65,7 +73,7 @@ def choose_interval(state, now=None):
     m = state.get('gpu_metrics')
     if not m or not 0 <= now - m['observed_at'] <= 600:
         return minimum, 'needs_fresh_task_metrics'
-    if m['ready_lanes'] and m['verified_gpus'] < m['target_gpus']:
+    if m['ready_lanes'] and m['verified_gpus'] < task_demand(m):
         if m['capacity'] == 'unavailable':
             return min(maximum, max(minimum, 180)), 'waiting_capacity'
         return minimum, 'runnable_task_shortfall'
@@ -96,6 +104,7 @@ def prompt_direction(state):
         return ''
     return ('按任务维持用户指定GPU数量，准备有效工作并及时补位；不要等待监督才派发。'
             '在状态JSON中附gpu对象：observed_at为本轮检查Unix秒，target_gpus为用户目标，'
+            '无固定GPU目标时target_gpus填null，按本轮已核验运行卡加预检待跑lane统计需求，不设上限；'
             'verified_gpus只计同模型PID显存及非零计算已核验的卡，ready_lanes为已预检待跑lane，'
             'capacity为available/unavailable/unknown，evidence为执行证据引用；'
             '可附job_runtime_seconds及next_completion_seconds，未知不猜。'
