@@ -18,6 +18,11 @@ codex-supervisor list
 
 `start`, `status` and `stop` accept `--thread UUID`. Starting supervision is authorized only by an explicit request; do not start it merely because a task is long. A failed original-frontend binding is a hard stop. Do not create a new conversation or hidden app-server turn.
 
+For persistent per-thread report requirements, add `--report-instructions "requirements"`
+to `start`. They remain in the protocol comment, separate from the task name.
+Later starts preserve them unless replaced; an empty string clears them. Keep
+them within 1000 characters without HTML comments or terminal escape characters.
+
 The first continuation occurs after a full interval, measured as a quiet period after actual conversation activity. Never interrupt or queue behind an active turn. Preserve the nonce in the submitted prompt. Do not create a Goal or enable GPU monitoring.
 
 A continuation reply begins with `TLS_SUPERVISION_CONTINUE` and ends with one `TLS_SUPERVISION_STATE:` JSON object containing `status` (`running`, `blocked`, `fault`), `fault`, and observable `evidence`. Plans and idle allocations are not execution evidence. GPU work must have model-sized memory and nonzero GPU compute belonging to the same model PID on the allocated GPU; never fall back to CPU or treat allocation alone as a result.
@@ -25,6 +30,12 @@ A continuation reply begins with `TLS_SUPERVISION_CONTINUE` and ends with one `T
 After two identical non-capacity fault reports, diagnose or repair and verify one concrete outcome. The controller stops after four identical reports or two missing/invalid state reports. Capacity waiting uses exactly three times the base interval, without compounding; restore the base interval when actual work resumes. An explicit `--fixed-interval` overrides capacity backoff.
 
 When the task is verified complete, stop the supervisor before replying with `TLS_SUPERVISION_COMPLETE`. A completion integration should call `codex-supervisor activity --event completed --turn-id TURN --thread UUID` after the reply; this preserves the final notification after an explicit stop. Without a completion integration, active supervisors collect replies on their next timer tick.
+
+Delivery failures stop the timer and write a private diagnostic under the state
+directory's `alerts/`. A late completed callback can recover a nonce-confirmation
+timeout only with the exact original binding, nonce, turn, continuation marker,
+and valid progress report. It never recovers manual stops or changed frontends,
+never resends the message, and uses a fresh full quiet interval after completion.
 
 Notifications are durable outbox records: every five distinct completed supervision turns, plus a final report. Chat delivery needs a separate transport adapter. Do not fabricate a successful Feishu/webhook delivery from an outbox file.
 

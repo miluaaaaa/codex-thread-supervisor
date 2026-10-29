@@ -53,6 +53,13 @@ codex-supervisor stop --thread UUID
 
 For a nondefault transcript home, add `--codex-home /path/to/codex-home` to `start`. `--gpu-wait` starts at three times the base interval; `--fixed-interval` explicitly keeps the requested interval during capacity waits. GPU waiting never relaxes execution verification.
 
+Add `--report-instructions "include the current progress table and concrete blockers"`
+to `start` for persistent per-thread reporting requirements. They appear only in
+the reminder's protocol comment, leaving the task name unchanged. Repeating
+`start` preserves these instructions unless explicitly replaced; pass an empty
+string to clear them. The limit is 1000 characters, without HTML comments or
+terminal escape characters.
+
 ## Progress protocol
 
 A continuation carries a nonce and requests a bounded progress check. Its reply starts with:
@@ -82,6 +89,21 @@ codex-supervisor activity --thread UUID --event completed --turn-id TURN_ID
 ```
 
 These are adapter entry points, **not a claim that all Codex versions expose a particular native hook schema**. Prompt/start callbacks provide earlier race protection. The completed callback collects the exact nonce-bound reply even after an explicit stop. Without callbacks, collection happens on the next active timer tick; an explicit stop before the final reply needs a completed callback to enqueue that final report. Input can still race between the last transcript check and terminal paste; avoid composing unsent drafts in a supervised pane because the safe handoff clears the composer.
+
+Completion callbacks arm an absolute quiet-period deadline so timer reloads and
+early wakes do not add another full interval. A delivery failure stops supervision
+and writes a private diagnostic record to
+`$SUPERVISOR_STATE_DIR/alerts/UUID.json` (under the default state directory when
+unset). This records a failure locally; it does not send a chat notification or
+establish whether the underlying task is still running.
+
+If only nonce confirmation timed out, a later completed callback may recover the
+same supervisor when the exact original binding (including tmux socket), reserved
+nonce, completed turn, continuation marker, and valid progress report all match.
+Manual stops, changed frontends, unrelated turns, and completed tasks never rearm
+supervision through this recovery path. Without a completion callback it stays
+stopped. Recovery preserves normal notification admission and does not resend the
+original message.
 
 ## Notifications
 

@@ -91,6 +91,13 @@ def validate_task(raw: str) -> str:
     return task.rstrip("。.!！")
 
 
+def validate_report_instructions(raw: str) -> str:
+    value = " ".join(raw.split())
+    if len(value) > 1000 or "<!--" in value or "-->" in value or "\x1b" in value:
+        raise ValueError("report instructions must be at most 1000 characters without HTML comments or terminal escapes")
+    return value
+
+
 def state_path(thread_id: str) -> Path:
     return STATE_ROOT / f"{thread_id}.json"
 
@@ -442,6 +449,8 @@ def supervision_prompt(nonce: str, task: str, now: int | None = None, *, state: 
     direction += peer_notification_direction(state, now)
     direction += agent_mail_notification_direction(state, now)
     direction += prompt_direction(state)
+    if state.get("report_instructions"):
+        direction += "每轮汇报要求：" + validate_report_instructions(state["report_instructions"]) + "。"
     if state.get("gpu_optimizer", {}).get("enabled"):
         direction += "周期由任务优化器调整，不使用原三倍容量退避。"
     elif state.get("fixed_interval"):
@@ -492,6 +501,7 @@ def confirm_visible_delivery(
     nonce: str,
     timeout: float = 180.0,
     submit_retry: Callable[[], None] | None = None,
+    retry_confirmation_timeout: float | None = None,
 ) -> str:
     deadline = time.monotonic() + max(0.0, timeout)
     retried = False
@@ -507,7 +517,8 @@ def confirm_visible_delivery(
             if submit_retry is not None and not retried:
                 submit_retry()
                 retried = True
-                deadline = time.monotonic() + max(0.0, timeout)
+                confirmation_timeout = timeout if retry_confirmation_timeout is None else retry_confirmation_timeout
+                deadline = time.monotonic() + max(0.0, confirmation_timeout)
                 continue
             raise RuntimeError("original Codex frontend did not record the supervision nonce")
         time.sleep(0.1)
@@ -528,6 +539,19 @@ def retry_frontend_submit(binding: dict[str, Any]) -> None:
 def retire(thread_id: str, state: dict[str, Any], reason: str, *, stop_guard: bool = True) -> None:
     _, timer_name = unit_names(thread_id)
     state.update({"active": False, "stopped_at": int(time.time()), "stop_reason": reason})
+    if reason == "delivery_failed":
+        notice = {
+            "thread_id": thread_id, "instance_id": state.get("instance_id"),
+            "stopped_at": state["stopped_at"], "reason": reason,
+            "error": state.get("last_error", ""),
+            "nonce": state.get("reservation_nonce", ""),
+            "message": "监督器投递失败，周期监督已停止；任务是否运行须另行核查。",
+        }
+        notice_path = STATE_ROOT / "alerts" / f"{thread_id}.json"
+        atomic_text(notice_path, json.dumps(notice, ensure_ascii=False, indent=2) + "\n")
+        state["fault_notice"] = notice
+        state["fault_notice_path"] = str(notice_path)
+        print(json.dumps(notice, ensure_ascii=False), file=sys.stderr)
     write_state(thread_id, state)
     run_systemctl("disable", "--now", timer_name, check=False)
     if stop_guard:
@@ -574,10 +598,41 @@ def defer_supervision(
     """Restart the quiet period after a Codex turn has actually finished."""
     state = load_state(thread_id)
     if not state.get("active", False):
-        return state
+        # Recover only a positively confirmed late supervision completion.
+        # Manual stops, changed frontends and unrelated turns cannot rearm it.
+        nonce = str(state.get("reservation_nonce", ""))
+        if state.get("stop_reason") != "delivery_failed" or not nonce or not completed_turn_id:
+            return state
+        if state.get("last_error") != "original Codex frontend did not record the supervision nonce":
+            return state
+        if not binding_matches(state.get("frontend_binding", {}), frontend_for(thread_id)):
+            return state
+        transcript = Path(str(state.get("reservation_transcript", "")))
+        if not transcript.is_file():
+            return state
+        snapshot = thread_snapshot(transcript)
+        if snapshot["nonce_turns"].get(nonce) != completed_turn_id:
+            return state
+        final = snapshot["completions"].get(completed_turn_id, "")
+        marker = final.lstrip().splitlines()[0].strip("` ") if final.strip() else ""
+        if marker != CONTINUE_MARKER or progress_report(final) is None:
+            return state
+        state.update({
+            "active": True, "last_nonce": nonce, "last_completed_nonce": nonce,
+            "last_completed_turn": completed_turn_id, "reservation_nonce": "",
+            "reservation_transcript": "", "awaiting_nonce": "",
+            "activity_turn_active": False, "activity_turn_id": "",
+            "late_delivery_recovered_at": int(time.time()),
+            "previous_stop_reason": state.get("stop_reason"), "stop_reason": "",
+        })
+        record_progress(state, final)
+        queue_report(state, nonce, final)
+        write_state(thread_id, state)
+        _, timer_name = unit_names(thread_id)
+        run_systemctl("enable", timer_name)
+        run_systemctl("restart", guard_unit_name(thread_id))
     migrate_activity_state(state)
     now = int(time.time()) if completed_at is None else int(completed_at)
-    previous_interval = int(state["interval_seconds"])
     if state.get("gpu_optimizer", {}).get("enabled") and completed_turn_id:
         transcript = transcript_for(thread_id, Path(str(state["codex_home"])))
         if transcript is not None:
@@ -591,8 +646,6 @@ def defer_supervision(
                     state["gpu_metrics_error"] = str(error)
         apply_optimizer(state, now)
     interval_seconds = int(state["interval_seconds"])
-    if interval_seconds != previous_interval:
-        refresh_timer_interval(thread_id, interval_seconds)
     active_turn_id = str(state.get("activity_turn_id", ""))
     completes_active_turn = bool(completed_turn_id and completed_turn_id == active_turn_id)
     no_identified_active_turn = not active_turn_id and not state.get("activity_turn_active", False)
@@ -607,8 +660,7 @@ def defer_supervision(
     if completes_active_turn or no_identified_active_turn:
         state.update({"activity_turn_active": False, "activity_turn_id": ""})
     write_state(thread_id, state)
-    _, timer_name = unit_names(thread_id)
-    run_systemctl("restart", timer_name)
+    refresh_timer_interval(thread_id, interval_seconds, deadline=now + interval_seconds)
     return state
 
 
@@ -655,7 +707,7 @@ def mark_turn_started(thread_id: str, turn_id: str = "", started_at: int | None 
 
 
 @serialized
-def start_supervisor(thread_id: str, interval_seconds: int, codex_home: Path, task: str, *, gpu_wait: bool = False, fixed_interval: bool = False) -> dict[str, Any]:
+def start_supervisor(thread_id: str, interval_seconds: int, codex_home: Path, task: str, *, gpu_wait: bool = False, fixed_interval: bool = False, report_instructions: str | None = None) -> dict[str, Any]:
     codex_home = codex_home.expanduser().resolve()
     task = validate_task(task)
     transcript = transcript_for(thread_id, codex_home)
@@ -670,6 +722,9 @@ def start_supervisor(thread_id: str, interval_seconds: int, codex_home: Path, ta
         previous = load_state(thread_id)
     except RuntimeError:
         previous = {}
+    if report_instructions is None:
+        report_instructions = str(previous.get("report_instructions", ""))
+    report_instructions = validate_report_instructions(report_instructions)
     if previous.get("active", False):
         run_systemctl("stop", guard_name, check=False)
     now = int(time.time())
@@ -686,6 +741,7 @@ def start_supervisor(thread_id: str, interval_seconds: int, codex_home: Path, ta
         "gpu_capacity_wait": gpu_wait,
         "fixed_interval": fixed_interval,
         "task": task,
+        "report_instructions": report_instructions,
         "codex_home": str(codex_home),
         "transcript": str(transcript),
         "frontend_binding": binding,
@@ -751,13 +807,20 @@ NoNewPrivileges=true
     return state
 
 
-def refresh_timer_interval(thread_id: str, interval_seconds: int) -> None:
+def refresh_timer_interval(thread_id: str, interval_seconds: int, *, deadline: int | None = None) -> None:
     _, timer_name = unit_names(thread_id)
     path = UNIT_ROOT / timer_name
     if not path.exists():
         return
+    if deadline is None:
+        deadline = int(time.time()) + interval_seconds
     timer = path.read_text(encoding="utf-8")
-    timer = re.sub(r"(?m)^(OnActiveSec|OnUnitActiveSec)=.*$", lambda m: f"{m[1]}={interval_seconds}s", timer)
+    # A monotonic OnActiveSec can be recalculated by the user manager during
+    # daemon-reload. Keep the quiet deadline absolute; subsequent ticks still
+    # use the interval while waiting for a turn or its completion receipt.
+    timer = re.sub(r"(?m)^(OnActiveSec|OnCalendar)=.*\n?", "", timer)
+    timer = timer.replace("[Timer]\n", f"[Timer]\nOnCalendar=@{deadline}\n", 1)
+    timer = re.sub(r"(?m)^OnUnitActiveSec=.*$", f"OnUnitActiveSec={interval_seconds}s", timer)
     timer = re.sub(r"(?m)^AccuracySec=.*$", "AccuracySec=5s", timer)
     atomic_text(path, timer, mode=0o644)
     run_systemctl("daemon-reload")
@@ -882,6 +945,8 @@ def prepare_supervision(thread_id: str) -> dict[str, Any]:
             }
         )
         write_state(thread_id, state)
+        # Rearm the remaining quiet period instead of waiting another interval.
+        refresh_timer_interval(thread_id, interval_seconds, deadline=due_at)
         return state
 
     nonce = secrets.token_hex(12)
@@ -987,6 +1052,7 @@ def run_supervision(thread_id: str) -> dict[str, Any]:
             # can replace the pending supervision message.
             timeout=15.0,
             submit_retry=submit_retry,
+            retry_confirmation_timeout=180.0,
         )
     except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as error:
         with thread_lock(thread_id):
@@ -1081,6 +1147,7 @@ def main() -> int:
     start.add_argument("--thread")
     start.add_argument("--interval", default="15min", help="Supervision interval (default: 15min)")
     start.add_argument("--task", required=True)
+    start.add_argument("--report-instructions", default=None, help="Per-thread reporting requirements (up to 1000 characters); preserved on restart")
     start.add_argument("--gpu-wait", action="store_true", help="Keep supervision active at 3x the base interval while GPUs are unavailable")
     start.add_argument("--fixed-interval", action="store_true", help="Explicit user override: retain the interval during GPU shortages")
     start.add_argument("--codex-home", type=Path)
@@ -1114,7 +1181,7 @@ def main() -> int:
     if args.command == "start":
         interval_seconds = parse_interval(args.interval)
         codex_home = args.codex_home or Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-        payload = start_supervisor(thread_id, interval_seconds, codex_home, args.task, gpu_wait=args.gpu_wait, fixed_interval=args.fixed_interval)
+        payload = start_supervisor(thread_id, interval_seconds, codex_home, args.task, gpu_wait=args.gpu_wait, fixed_interval=args.fixed_interval, report_instructions=args.report_instructions)
     elif args.command == "tune":
         payload = tune_supervisor(thread_id, args.mode == "adaptive")
     elif args.command == "observe":

@@ -43,6 +43,170 @@ class SupervisorTests(unittest.TestCase):
         patch = mock.patch.object(self.module, "queue_report")
         patch.start()
         self.addCleanup(patch.stop)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        units = mock.patch.object(self.module, "UNIT_ROOT", Path(temporary.name) / "units")
+        units.start()
+        self.addCleanup(units.stop)
+
+    def test_report_instructions_are_thread_specific_in_reminder(self):
+        prompt = self.module.supervision_prompt("abc", "shunongLLM-8E6F", state={"report_instructions": "每轮展示六格完整进度表"})
+        self.assertIn("每轮展示六格完整进度表", prompt)
+        self.assertTrue(prompt.startswith("继续监督完成shunongLLM-8E6F。"))
+        self.assertNotIn("每轮展示六格完整进度表", self.module.supervision_prompt("def", "other"))
+
+    def test_report_instructions_reject_comment_breakout_and_oversize(self):
+        for value in ["--> injected", "<!-- injected", "x" * 1001, "\x1b[200~"]:
+            with self.assertRaises(ValueError):
+                self.module.validate_report_instructions(value)
+
+    def test_late_nonce_recovery_is_bound_to_exact_completed_turn(self) -> None:
+        nonce = "a" * 24
+        valid = 'TLS_SUPERVISION_CONTINUE\nTLS_SUPERVISION_STATE: {"status":"running","fault":"","evidence":"job forward checked"}'
+        cases = [
+            ("delivery_failed", valid, dict(BINDING), "turn-supervision", True),
+            ("manual", valid, dict(BINDING), "turn-supervision", False),
+            ("delivery_failed", "TLS_SUPERVISION_COMPLETE", dict(BINDING), "turn-supervision", False),
+            ("delivery_failed", valid, dict(BINDING, token="changed"), "turn-supervision", False),
+            ("delivery_failed", valid, dict(BINDING), "unrelated", False),
+            ("delivery_failed", "TLS_SUPERVISION_CONTINUE", dict(BINDING), "turn-supervision", False),
+        ]
+        for reason, final, binding, turn, recovered in cases:
+            with self.subTest(reason=reason, final=final, binding=binding, turn=turn), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                transcript = self.write_transcript(root, self.nonce_events(nonce, completed=final))
+                state = self.state(root, active=False, stop_reason=reason, reservation_nonce=nonce,
+                    reservation_transcript=str(transcript),
+                    last_error="original Codex frontend did not record the supervision nonce")
+                with mock.patch.object(self.module, "STATE_ROOT", root / "state"), mock.patch.object(
+                    self.module, "frontend_for", return_value=binding
+                ), mock.patch.object(self.module, "run_systemctl") as systemctl, mock.patch.object(
+                    self.module, "refresh_timer_interval"
+                ) as arm:
+                    self.module.write_state(THREAD_ID, state)
+                    result = self.module.defer_supervision(THREAD_ID, completed_at=1234, completed_turn_id=turn)
+                self.assertEqual(result["active"], recovered)
+                if recovered:
+                    self.assertEqual(result["last_completed_nonce"], nonce)
+                    self.assertEqual(result["next_trigger_at"], 1234 + 900)
+                    self.assertEqual(systemctl.call_count, 2)
+                    arm.assert_called_once_with(THREAD_ID, 900, deadline=2134)
+                else:
+                    systemctl.assert_not_called()
+
+    def test_delivery_failure_persists_fault_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = self.state(root, last_error="nonce timeout", reservation_nonce="a" * 24)
+            with mock.patch.object(self.module, "STATE_ROOT", root), mock.patch.object(
+                self.module, "run_systemctl"
+            ), mock.patch.object(self.module.sys, "stderr"):
+                self.module.retire(THREAD_ID, state, "delivery_failed")
+            notice = json.loads(Path(state["fault_notice_path"]).read_text())
+            self.assertEqual(notice["nonce"], "a" * 24)
+            self.assertEqual(notice["error"], "nonce timeout")
+            self.assertFalse(state["active"])
+
+    def test_refresh_uses_frozen_deadline_instead_of_restarting_delay_at_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, timer = self.module.unit_names(THREAD_ID)
+            path = root / timer
+            path.write_text('[Timer]\nOnCalendar=@1500\nOnUnitActiveSec=900s\nAccuracySec=5s\n')
+            with mock.patch.object(self.module, 'UNIT_ROOT', root), mock.patch.object(self.module, 'time') as clock, mock.patch.object(self.module, 'run_systemctl'):
+                clock.time.return_value = 1346
+                self.module.refresh_timer_interval(THREAD_ID, 900, deadline=1900)
+            self.assertIn('OnCalendar=@1900', path.read_text())
+            self.assertNotIn('@2246', path.read_text())
+            self.assertEqual(path.read_text().count('OnCalendar='), 1)
+
+    def test_confirmation_accepts_incident_delayed_nonce_after_single_enter(self) -> None:
+        missing = {"nonce_turns": {}, "completions": {}}
+        accepted = {"nonce_turns": {"a" * 24: "turn-delayed"}, "completions": {}}
+        retry = mock.Mock()
+        with mock.patch.object(self.module, "frontend_for", return_value=dict(BINDING)), mock.patch.object(
+            self.module, "thread_snapshot", side_effect=[missing, missing, missing, accepted]
+        ), mock.patch.object(self.module.time, "monotonic", side_effect=[0, 0, 15, 15, 32]), mock.patch.object(
+            self.module.time, "sleep"
+        ):
+            result = self.module.confirm_visible_delivery(
+                THREAD_ID, Path("unused"), dict(BINDING), "a" * 24,
+                timeout=15, submit_retry=retry, retry_confirmation_timeout=180,
+            )
+        self.assertEqual(result, "turn-delayed")
+        retry.assert_called_once_with()
+
+    def test_early_wakeup_rearms_exact_quiet_deadline_without_an_extra_interval(self) -> None:
+        events = [
+            {"type": "event_msg", "timestamp": "2026-09-10T12:00:00Z", "payload": {"type": "task_complete", "turn_id": "turn-user", "last_agent_message": "done"}}
+        ]
+        due_at = 1789042500
+        for seconds_early in (1, 600):
+            with self.subTest(seconds_early=seconds_early), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                transcript = self.write_transcript(root, events)
+                with mock.patch.object(self.module, "STATE_ROOT", root / "state"), mock.patch.object(
+                    self.module, "transcript_for", return_value=transcript
+                ), mock.patch.object(self.module, "frontend_for", return_value=dict(BINDING)), mock.patch.object(
+                    self.module, "refresh_timer_interval"
+                ) as arm, mock.patch.object(self.module.time, "time", return_value=due_at-seconds_early) as clock:
+                    self.module.write_state(THREAD_ID, self.state(root, next_trigger_at=due_at-seconds_early))
+                    waiting = self.module.prepare_supervision(THREAD_ID)
+                    self.assertEqual(waiting["delivery_status"], "waiting_after_activity")
+                    self.assertEqual(waiting["next_trigger_at"], due_at)
+                    arm.assert_called_once_with(THREAD_ID, 900, deadline=due_at)
+                    clock.return_value = due_at
+                    ready = self.module.prepare_supervision(THREAD_ID)
+                    self.assertEqual(ready["delivery_status"], "delivery_reserved")
+                    self.assertTrue(ready["reservation_nonce"])
+
+    def test_report_instructions_persist_replace_and_clear_on_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = self.write_transcript(root, [])
+            with mock.patch.object(self.module, "STATE_ROOT", root / "state"), mock.patch.object(
+                self.module, "transcript_for", return_value=transcript
+            ), mock.patch.object(self.module, "frontend_for", return_value=dict(BINDING)), mock.patch.object(
+                self.module, "run_systemctl"
+            ):
+                start = self.module.start_supervisor
+                first = start(THREAD_ID, 900, root, TASK, report_instructions="show progress")
+                preserved = start(THREAD_ID, 900, root, TASK)
+                replaced = start(THREAD_ID, 900, root, TASK, report_instructions="show blockers")
+                cleared = start(THREAD_ID, 900, root, TASK, report_instructions="")
+            self.assertEqual(first["report_instructions"], "show progress")
+            self.assertEqual(preserved["report_instructions"], "show progress")
+            self.assertEqual(replaced["report_instructions"], "show blockers")
+            self.assertEqual(cleared["report_instructions"], "")
+
+    def test_late_recovery_rejects_wrong_error_nonce_and_tmux_socket(self):
+        nonce = "a" * 24
+        final = 'TLS_SUPERVISION_CONTINUE\nTLS_SUPERVISION_STATE: {"status":"running","fault":"","evidence":"checked outputs"}'
+        binding = dict(BINDING, backend="tmux", tmux_socket="/tmp/original.sock")
+        for change in ("error", "nonce", "socket", "transcript"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                transcript = self.write_transcript(root, self.nonce_events(nonce, completed=final))
+                state = self.state(root, active=False, stop_reason="delivery_failed",
+                                   frontend_binding=binding, reservation_nonce=nonce,
+                                   reservation_transcript=str(transcript),
+                                   last_error="original Codex frontend did not record the supervision nonce")
+                current = dict(binding)
+                if change == "error":
+                    state["last_error"] = "frontend unavailable"
+                elif change == "nonce":
+                    state["reservation_nonce"] = "b" * 24
+                elif change == "socket":
+                    current["tmux_socket"] = "/tmp/other.sock"
+                else:
+                    state["reservation_transcript"] = str(root / "absent")
+                with mock.patch.object(self.module, "STATE_ROOT", root / "state"), mock.patch.object(
+                    self.module, "frontend_for", return_value=current
+                ), mock.patch.object(self.module, "run_systemctl") as systemctl:
+                    self.module.write_state(THREAD_ID, state)
+                    result = self.module.defer_supervision(THREAD_ID, completed_turn_id="turn-supervision")
+                self.assertFalse(result["active"])
+                systemctl.assert_not_called()
 
     def write_transcript(self, root: Path, events: list[dict]) -> Path:
         path = root / "rollout.jsonl"
@@ -143,7 +307,7 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(result["next_trigger_at"], 1180)
             self.assertFalse(result["activity_turn_active"])
             self.assertEqual(result["gpu_task_stats"]["observations"], 1)
-            refresh.assert_called_once_with(THREAD_ID, 180)
+            refresh.assert_called_once_with(THREAD_ID, 180, deadline=1180)
 
     def test_observation_updates_real_timer_and_disable_restores_fixed_mode(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -165,12 +329,12 @@ class SupervisorTests(unittest.TestCase):
                 result = self.module.observe_task(THREAD_ID, metrics)
                 self.assertEqual(result["interval_seconds"], 180)
                 self.assertNotIn("gpu_metrics_error", result)
-                self.assertIn("OnActiveSec=180s", timer.read_text())
+                self.assertIn("OnCalendar=@1180", timer.read_text())
                 self.assertIn("AccuracySec=5s", timer.read_text())
                 result = self.module.tune_supervisor(THREAD_ID, False)
                 self.assertTrue(result["fixed_interval"])
                 self.assertEqual(result["interval_seconds"], 300)
-                self.assertIn("OnActiveSec=300s", timer.read_text())
+                self.assertIn("OnCalendar=@1300", timer.read_text())
 
     def test_controller_can_be_loaded_from_external_completion_hook(self):
         import subprocess
@@ -378,9 +542,11 @@ class SupervisorTests(unittest.TestCase):
             _, timer = self.module.unit_names(THREAD_ID)
             path = root / timer
             path.write_text('[Timer]\nOnActiveSec=300s\nOnUnitActiveSec=300s\n')
-            with mock.patch.object(self.module, 'UNIT_ROOT', root), mock.patch.object(self.module, 'run_systemctl') as systemctl:
+            with mock.patch.object(self.module, 'UNIT_ROOT', root), mock.patch.object(self.module, 'time') as clock, mock.patch.object(self.module, 'run_systemctl') as systemctl:
+                clock.time.return_value = 1000
                 self.module.refresh_timer_interval(THREAD_ID, 900)
-                self.assertIn('OnActiveSec=900s', path.read_text())
+                self.assertIn('OnCalendar=@1900', path.read_text())
+                self.assertNotIn('OnActiveSec=', path.read_text())
                 self.assertIn('OnUnitActiveSec=900s', path.read_text())
                 systemctl.assert_any_call('restart', timer)
 
@@ -641,6 +807,7 @@ class SupervisorTests(unittest.TestCase):
                 result = self.module.run_supervision(THREAD_ID)
             deliver.assert_called_once()
             self.assertEqual(confirm.call_args.kwargs["timeout"], 15.0)
+            self.assertEqual(confirm.call_args.kwargs["retry_confirmation_timeout"], 180.0)
             self.assertIn("TLS_SUPERVISION_NONCE:" + "b" * 24, deliver.call_args.args[1])
             self.assertIn("先停监督", deliver.call_args.args[1])
             self.assertNotIn(THREAD_ID, deliver.call_args.args[1])
@@ -703,13 +870,13 @@ class SupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with mock.patch.object(self.module, "STATE_ROOT", root / "state"), mock.patch.object(
-                self.module, "run_systemctl"
-            ) as systemctl:
+                self.module, "refresh_timer_interval"
+            ) as arm:
                 self.module.write_state(THREAD_ID, self.state(root))
                 result = self.module.defer_supervision(THREAD_ID, completed_at=1000)
             self.assertEqual(result["next_trigger_at"], 1900)
             self.assertEqual(result["delivery_status"], "waiting_after_activity")
-            systemctl.assert_called_once_with("restart", self.module.unit_names(THREAD_ID)[1])
+            arm.assert_called_once_with(THREAD_ID, 900, deadline=1900)
 
     def test_old_stop_cannot_clear_a_newer_active_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
